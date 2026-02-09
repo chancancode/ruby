@@ -143,7 +143,7 @@ pub enum Invariant {
     /// TracePoint is not enabled. If TracePoint is enabled, this is invalidated.
     NoTracePoint,
     /// cfp->ep is not escaped to the heap on the ISEQ
-    NoEPEscape(IseqPtr),
+    NoEPEscape(Iseq),
     /// There is one ractor running. If a non-root ractor gets spawned, this is invalidated.
     SingleRactorMode,
     /// Objects of this class have no singleton class.
@@ -1077,7 +1077,7 @@ impl Insn {
         }
     }
 
-    pub fn print<'a>(&self, ptr_map: &'a PtrPrintMap, iseq: Option<IseqPtr>) -> InsnPrinter<'a> {
+    pub fn print<'a>(&self, ptr_map: &'a PtrPrintMap, iseq: Option<Iseq>) -> InsnPrinter<'a> {
         InsnPrinter { inner: self.clone(), ptr_map, iseq }
     }
 
@@ -1253,7 +1253,7 @@ impl Insn {
 pub struct InsnPrinter<'a> {
     inner: Insn,
     ptr_map: &'a PtrPrintMap,
-    iseq: Option<IseqPtr>,
+    iseq: Option<Iseq>,
 }
 
 /// Get the name of a local variable given iseq, level, and ep_offset.
@@ -1264,13 +1264,13 @@ pub struct InsnPrinter<'a> {
 ///   (When `Insn` is printed in a panic/debug message the `Display::fmt` method is called, which can't access an iseq.)
 ///
 /// This mimics local_var_name() from iseq.c.
-fn get_local_var_name_for_printer(iseq: Option<IseqPtr>, level: u32, ep_offset: u32) -> Option<String> {
+fn get_local_var_name_for_printer(iseq: Option<Iseq>, level: u32, ep_offset: u32) -> Option<String> {
     let mut current_iseq = iseq?;
     for _ in 0..level {
-        current_iseq = unsafe { rb_get_iseq_body_parent_iseq(current_iseq) };
+        current_iseq = Iseq::new(unsafe { rb_get_iseq_body_parent_iseq(current_iseq.as_ptr()) })?;
     }
     let local_idx = ep_offset_to_local_idx(current_iseq, ep_offset);
-    let id: ID = unsafe { rb_zjit_local_id(current_iseq, local_idx.try_into().unwrap()) };
+    let id: ID = unsafe { rb_zjit_local_id(current_iseq.as_ptr(), local_idx.try_into().unwrap()) };
 
     if id.0 == 0 || unsafe { rb_id2str(id) } == Qfalse {
         return Some(String::from("<empty>"));
@@ -1914,7 +1914,7 @@ fn can_direct_send(function: &mut Function, block: BlockId, iseq: Iseq, ci: *con
 #[derive(Debug)]
 pub struct Function {
     // ISEQ this function refers to
-    iseq: *const rb_iseq_t,
+    iseq: Iseq,
     /// The types for the parameters of this function. They are copied to the type
     /// of entry block params after infer_types() fills Empty to all insn_types.
     param_types: Vec<Type>,
@@ -1945,7 +1945,7 @@ unsafe extern "C" {
 }
 
 /// Return the ISEQ's return value if it consists of one simple instruction and leave.
-fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags: u32) -> Option<IseqReturn> {
+fn iseq_get_return_value(iseq: Iseq, captured_opnd: Option<InsnId>, ci_flags: u32) -> Option<IseqReturn> {
     // Expect only two instructions and one possible operand
     // NOTE: If an ISEQ has an optional keyword parameter with a default value that requires
     // computation, the ISEQ will always have more than two instructions and won't be inlined.
@@ -1974,16 +1974,16 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
                 return None;
             }
 
-            let ep_offset = unsafe { *rb_iseq_pc_at_idx(iseq, 1) }.as_u32();
+            let ep_offset = unsafe { *rb_iseq_pc_at_idx(iseq.as_ptr(), 1) }.as_u32();
             let local_idx = ep_offset_to_local_idx(iseq, ep_offset);
 
             // Only inline if the local is a parameter (not a method-defined local) as we are indexing args.
-            let param_size = unsafe { rb_get_iseq_body_param_size(iseq) } as usize;
+            let param_size = unsafe { rb_get_iseq_body_param_size(iseq.as_ptr()) } as usize;
             if local_idx >= param_size {
                 return None;
             }
 
-            if unsafe { rb_simple_iseq_p(iseq) } {
+            if unsafe { rb_simple_iseq_p(iseq.as_ptr()) } {
                 return Some(IseqReturn::LocalVariable(local_idx.try_into().unwrap()));
             }
 
@@ -1992,17 +1992,17 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
             None
         }
         YARVINSN_putnil => Some(IseqReturn::Value(Qnil)),
-        YARVINSN_putobject => Some(IseqReturn::Value(unsafe { *rb_iseq_pc_at_idx(iseq, 1) })),
+        YARVINSN_putobject => Some(IseqReturn::Value(unsafe { *rb_iseq_pc_at_idx(iseq.as_ptr(), 1) })),
         YARVINSN_putobject_INT2FIX_0_ => Some(IseqReturn::Value(VALUE::fixnum_from_usize(0))),
         YARVINSN_putobject_INT2FIX_1_ => Some(IseqReturn::Value(VALUE::fixnum_from_usize(1))),
         // We don't support invokeblock for now. Such ISEQs are likely not used by blocks anyway.
         YARVINSN_putself if captured_opnd.is_none() => Some(IseqReturn::Receiver),
         YARVINSN_opt_invokebuiltin_delegate_leave => {
-            let pc = unsafe { rb_iseq_pc_at_idx(iseq, 0) };
+            let pc = unsafe { rb_iseq_pc_at_idx(iseq.as_ptr(), 0) };
             let bf: rb_builtin_function = unsafe { *get_arg(pc, 0).as_ptr() };
             let argc = bf.argc as usize;
             if argc != 0 { return None; }
-            let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(iseq) };
+            let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(iseq.as_ptr()) };
             let leaf = builtin_attrs & BUILTIN_ATTR_LEAF != 0;
             if !leaf { return None; }
             // Check if this builtin is annotated
@@ -2016,7 +2016,7 @@ fn iseq_get_return_value(iseq: IseqPtr, captured_opnd: Option<InsnId>, ci_flags:
 }
 
 impl Function {
-    fn new(iseq: *const rb_iseq_t) -> Function {
+    fn new(iseq: Iseq) -> Function {
         Function {
             iseq,
             insns: vec![],
@@ -2030,7 +2030,7 @@ impl Function {
         }
     }
 
-    pub fn iseq(&self) -> *const rb_iseq_t {
+    pub fn iseq(&self) -> Iseq {
         self.iseq
     }
 
@@ -2561,8 +2561,7 @@ impl Function {
 
     /// Set self.param_types. They are copied to the param types of jit_entry_blocks.
     fn set_param_types(&mut self) {
-        let iseq = self.iseq;
-        let params = unsafe { iseq.params() };
+        let params = unsafe { self.iseq.params() };
         let param_size = params.size.to_usize();
         let rest_param_idx = iseq_rest_param_idx(params);
 
@@ -3101,7 +3100,7 @@ impl Function {
                             let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
 
                             // SAFETY: def_type == VM_METHOD_TYPE_ISEQ should guarentee iseq is non-null
-                            let iseq = Iseq::new(iseq).unwrap();
+                            let iseq = expect_iseq!(iseq);
 
                             if !can_direct_send(self, block, iseq, ci, insn_id, args.as_slice(), None) {
                                 self.push_insn_id(block, insn_id); continue;
@@ -3142,7 +3141,7 @@ impl Function {
                             let iseq = unsafe { *capture.code.iseq.as_ref() };
 
                             // SAFETY: proc_block.type_ == block_type_iseq should guarentee iseq is non-null
-                            let iseq = Iseq::new(iseq).unwrap();
+                            let iseq = expect_iseq!(iseq);
 
                             if !can_direct_send(self, block, iseq, ci, insn_id, args.as_slice(), None) {
                                 self.push_insn_id(block, insn_id); continue;
@@ -3369,7 +3368,7 @@ impl Function {
                             let iseq = unsafe { get_def_iseq_ptr((*cme).def) };
 
                             // SAFETY: def_type == VM_METHOD_TYPE_ISEQ should guarentee iseq is non-null
-                            let iseq = Iseq::new(iseq).unwrap();
+                            let iseq = expect_iseq!(iseq);
 
                             if !can_direct_send(self, block, iseq, ci, insn_id, args.as_slice(), blockiseq) {
                                 self.push_insn_id(block, insn_id); continue;
@@ -3612,7 +3611,7 @@ impl Function {
                             let super_iseq = unsafe { get_def_iseq_ptr((*super_cme).def) };
 
                             // SAFETY: def_type == VM_METHOD_TYPE_ISEQ should guarentee iseq is non-null
-                            let super_iseq = Iseq::new(super_iseq).unwrap();
+                            let super_iseq = expect_iseq!(super_iseq);
 
                             // TODO: pass Option<blockiseq> to can_direct_send when we start specializing `super { ... }`.
                             if !can_direct_send(self, block, super_iseq, ci, insn_id, args.as_slice(), None) {
@@ -3796,7 +3795,7 @@ impl Function {
                         if ci_flags & VM_CALL_OPT_SEND != 0 {
                             self.push_insn_id(block, insn_id); continue;
                         }
-                        let Some(value) = iseq_get_return_value(iseq.as_ptr(), None, ci_flags) else {
+                        let Some(value) = iseq_get_return_value(iseq, None, ci_flags) else {
                             self.push_insn_id(block, insn_id); continue;
                         };
                         match value {
@@ -5246,7 +5245,7 @@ impl Function {
         run_pass!(eliminate_dead_code);
 
         if should_dump {
-            let iseq_name = iseq_get_location(self.iseq, 0);
+            let iseq_name = self.iseq.to_string();
             self.dump_iongraph(&iseq_name, passes);
         }
     }
@@ -5749,12 +5748,7 @@ impl Function {
 impl<'a> std::fmt::Display for FunctionPrinter<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let fun = &self.fun;
-        // In tests, there may not be an iseq to get location from.
-        let iseq_name = if fun.iseq.is_null() {
-            String::from("<manual>")
-        } else {
-            iseq_get_location(fun.iseq, 0)
-        };
+        let iseq_name = fun.iseq.to_string();
 
         // In tests, strip the line number for builtin ISEQs to make tests stable across line changes
         let iseq_name = if cfg!(test) && iseq_name.contains("@<internal:") {
@@ -5828,9 +5822,8 @@ impl<'a> std::fmt::Display for FunctionGraphvizPrinter<'a> {
         }
         use std::fmt::Write;
         let fun = &self.fun;
-        let iseq_name = iseq_get_location(fun.iseq, 0);
         write!(f, "digraph G {{ # ")?;
-        write_encoded!(f, "{iseq_name}")?;
+        write_encoded!(f, "{}", fun.iseq)?;
         writeln!(f)?;
         writeln!(f, "node [shape=plaintext];")?;
         writeln!(f, "mode=hier; overlap=false; splines=true;")?;
@@ -5882,7 +5875,7 @@ impl<'a> std::fmt::Display for FunctionGraphvizPrinter<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameState {
-    iseq: IseqPtr,
+    iseq: Iseq,
     insn_idx: usize,
     // Ruby bytecode instruction pointer
     pub pc: *const VALUE,
@@ -5937,7 +5930,7 @@ pub struct FrameStatePrinter<'a> {
 }
 
 /// Compute the index of a local variable from its slot index
-fn ep_offset_to_local_idx(iseq: IseqPtr, ep_offset: u32) -> usize {
+fn ep_offset_to_local_idx(iseq: Iseq, ep_offset: u32) -> usize {
     // Layout illustration
     // This is an array of VALUE
     //                                           | VM_ENV_DATA_SIZE |
@@ -5953,7 +5946,7 @@ fn ep_offset_to_local_idx(iseq: IseqPtr, ep_offset: u32) -> usize {
     // See usages of local_var_name() from iseq.c for similar calculation.
 
     // Equivalent of iseq->body->local_table_size
-    let local_table_size: i32 = unsafe { get_iseq_body_local_table_size(iseq) }
+    let local_table_size: i32 = unsafe { get_iseq_body_local_table_size(iseq.as_ptr()) }
         .try_into()
         .unwrap();
     let op = (ep_offset - VM_ENV_DATA_SIZE) as i32;
@@ -5963,7 +5956,7 @@ fn ep_offset_to_local_idx(iseq: IseqPtr, ep_offset: u32) -> usize {
 }
 
 impl FrameState {
-    fn new(iseq: IseqPtr) -> FrameState {
+    fn new(iseq: Iseq) -> FrameState {
         FrameState { iseq, pc: std::ptr::null::<VALUE>(), insn_idx: 0, stack: vec![], locals: vec![] }
     }
 
@@ -6043,7 +6036,7 @@ impl FrameState {
 
     /// Get the opcode for the current instruction
     pub fn get_opcode(&self) -> i32 {
-        unsafe { rb_iseq_opcode_at_pc(self.iseq, self.pc) }
+        unsafe { rb_iseq_opcode_at_pc(self.iseq.as_ptr(), self.pc) }
     }
 
     pub fn print<'a>(&'a self, ptr_map: &'a PtrPrintMap) -> FrameStatePrinter<'a> {
@@ -6058,7 +6051,7 @@ impl Display for FrameStatePrinter<'_> {
         write_vec(f, &inner.stack)?;
         write!(f, ", locals: [")?;
         for (idx, local) in inner.locals.iter().enumerate() {
-            let name: ID = unsafe { rb_zjit_local_id(inner.iseq, idx.try_into().unwrap()) };
+            let name: ID = unsafe { rb_zjit_local_id(inner.iseq.as_ptr(), idx.try_into().unwrap()) };
             let name = name.contents_lossy();
             if idx > 0 { write!(f, ", ")?; }
             write!(f, "{name}={local}")?;
@@ -6078,7 +6071,7 @@ fn insn_idx_at_offset(idx: u32, offset: i64) -> u32 {
 }
 
 /// List of insn_idx that starts a JIT entry block
-pub fn jit_entry_insns(iseq: IseqPtr) -> Vec<u32> {
+pub fn jit_entry_insns(iseq: Iseq) -> Vec<u32> {
     // TODO(alan): Make an iterator type for this instead of copying all of the opt_table each call
     let params = unsafe { iseq.params() };
     let opt_num = params.opt_num;
@@ -6101,17 +6094,17 @@ struct BytecodeInfo {
     has_blockiseq: bool,
 }
 
-fn compute_bytecode_info(iseq: *const rb_iseq_t, opt_table: &[u32]) -> BytecodeInfo {
-    let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+fn compute_bytecode_info(iseq: Iseq, opt_table: &[u32]) -> BytecodeInfo {
+    let iseq_size = unsafe { get_iseq_encoded_size(iseq.as_ptr()) };
     let mut insn_idx = 0;
     let mut jump_targets: HashSet<u32> = opt_table.iter().copied().collect();
     let mut has_blockiseq = false;
     while insn_idx < iseq_size {
         // Get the current pc and opcode
-        let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+        let pc = unsafe { rb_iseq_pc_at_idx(iseq.as_ptr(), insn_idx) };
 
         // try_into() call below is unfortunate. Maybe pick i32 instead of usize for opcodes.
-        let opcode: u32 = unsafe { rb_iseq_opcode_at_pc(iseq, pc) }
+        let opcode: u32 = unsafe { rb_iseq_opcode_at_pc(iseq.as_ptr(), pc) }
             .try_into()
             .unwrap();
         insn_idx += insn_len(opcode as usize);
@@ -6159,8 +6152,8 @@ pub enum ParseError {
 }
 
 /// Return the number of locals in the current ISEQ (includes parameters)
-fn num_locals(iseq: *const rb_iseq_t) -> usize {
-    (unsafe { get_iseq_body_local_table_size(iseq) }).to_usize()
+fn num_locals(iseq: Iseq) -> usize {
+    (unsafe { get_iseq_body_local_table_size(iseq.as_ptr()) }).to_usize()
 }
 
 /// If we can't handle the type of send (yet), bail out.
@@ -6245,7 +6238,7 @@ fn invalidates_locals(opcode: u32, operands: *const VALUE) -> bool {
 pub const SELF_PARAM_IDX: usize = 0;
 
 /// Compile ISEQ into High-level IR
-pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
+pub fn iseq_to_hir(iseq: Iseq) -> Result<Function, ParseError> {
     if !ZJITState::can_compile_iseq(iseq) {
         return Err(ParseError::NotAllowed);
     }
@@ -6298,7 +6291,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
 
     // Keep compiling blocks until the queue becomes empty
     let mut visited = HashSet::new();
-    let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+    let iseq_size = unsafe { get_iseq_encoded_size(iseq.as_ptr()) };
     while let Some((incoming_state, block, mut insn_idx, mut local_inval)) = queue.pop_front() {
         // Compile each block only once
         if visited.contains(&block) { continue; }
@@ -6325,12 +6318,12 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
         while insn_idx < iseq_size {
             state.insn_idx = insn_idx as usize;
             // Get the current pc and opcode
-            let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+            let pc = unsafe { rb_iseq_pc_at_idx(iseq.as_ptr(), insn_idx) };
             state.pc = pc;
             let exit_state = state.clone();
 
             // try_into() call below is unfortunate. Maybe pick i32 instead of usize for opcodes.
-            let opcode: u32 = unsafe { rb_iseq_opcode_at_pc(iseq, pc) }
+            let opcode: u32 = unsafe { rb_iseq_opcode_at_pc(iseq.as_ptr(), pc) }
                 .try_into()
                 .unwrap();
 
@@ -6417,7 +6410,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                 fn rb_iseq_event_flags(iseq: IseqPtr, pos: usize) -> rb_event_flag_t;
             }
             let exit_id = fun.push_insn(block, Insn::Snapshot { state: exit_state.clone() });
-            if unsafe { rb_iseq_event_flags(iseq, insn_idx as usize) } != 0 {
+            if unsafe { rb_iseq_event_flags(iseq.as_ptr(), insn_idx as usize) } != 0 {
                 fun.push_insn(block, Insn::PatchPoint { invariant: Invariant::NoTracePoint, state: exit_id });
             }
 
@@ -6610,7 +6603,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     // When a keyword is unspecified past index 32, a hash will be used instead.
                     // This can only happen in iseqs taking more than 32 keywords.
                     // In this case, we side exit to the interpreter.
-                    if unsafe {(*rb_get_iseq_body_param_keyword(iseq)).num >= VM_KW_SPECIFIED_BITS_MAX.try_into().unwrap()} {
+                    if unsafe {(*rb_get_iseq_body_param_keyword(iseq.as_ptr())).num >= VM_KW_SPECIFIED_BITS_MAX.try_into().unwrap()} {
                         fun.push_insn(block, Insn::SideExit { state: exit_id, reason: SideExitReason::TooManyKeywordParameters });
                         break;
                     }
@@ -7367,7 +7360,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                         .get_builtin_properties(&bf)
                         .map(|props| props.return_type);
 
-                    let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(iseq) };
+                    let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(iseq.as_ptr()) };
                     let leaf = builtin_attrs & BUILTIN_ATTR_LEAF != 0;
 
                     let insn_id = fun.push_insn(block, Insn::InvokeBuiltin {
@@ -7396,7 +7389,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                         .get_builtin_properties(&bf)
                         .map(|props| props.return_type);
 
-                    let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(iseq) };
+                    let builtin_attrs = unsafe { rb_jit_iseq_builtin_attrs(iseq.as_ptr()) };
                     let leaf = builtin_attrs & BUILTIN_ATTR_LEAF != 0;
 
                     let insn_id = fun.push_insn(block, Insn::InvokeBuiltin {
@@ -7522,7 +7515,7 @@ fn compile_entry_block(fun: &mut Function, jit_entry_insns: &[u32], insn_idx_to_
         // Load PC once at the start of the block, shared among all cases
         let pc = *pc.get_or_insert_with(|| fun.push_insn(entry_block, Insn::LoadPC));
         let expected_pc = fun.push_insn(entry_block, Insn::Const {
-            val: Const::CPtr(unsafe { rb_iseq_pc_at_idx(fun.iseq, jit_entry_insn) } as *const u8),
+            val: Const::CPtr(unsafe { rb_iseq_pc_at_idx(fun.iseq.as_ptr(), jit_entry_insn) } as *const u8),
         });
         let test_id = fun.push_insn(entry_block, Insn::IsBitEqual { left: pc, right: expected_pc });
         fun.push_insn(entry_block, Insn::IfTrue {
@@ -7586,8 +7579,8 @@ fn compile_jit_entry_state(fun: &mut Function, jit_entry_block: BlockId, jit_ent
     let passed_opt_num = jit_entry_idx;
 
     // If the iseq has keyword parameters, the keyword bits local will be appended to the local table.
-    let kw_bits_idx: Option<usize> = if unsafe { rb_get_iseq_flags_has_kw(iseq) } {
-        let keyword = unsafe { rb_get_iseq_body_param_keyword(iseq) };
+    let kw_bits_idx: Option<usize> = if unsafe { rb_get_iseq_flags_has_kw(iseq.as_ptr()) } {
+        let keyword = unsafe { rb_get_iseq_body_param_keyword(iseq.as_ptr()) };
         if !keyword.is_null() {
             Some(unsafe { (*keyword).bits_start } as usize)
         } else {
@@ -7879,6 +7872,12 @@ impl<'a> LoopInfo<'a> {
 }
 
 #[cfg(test)]
+fn fake_function() -> Function {
+    Function::new(unsafe { Iseq::dangling() })
+}
+
+
+#[cfg(test)]
 mod union_find_tests {
     use super::UnionFind;
 
@@ -7921,7 +7920,7 @@ mod rpo_tests {
 
     #[test]
     fn one_block() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::Return { val });
@@ -7930,7 +7929,7 @@ mod rpo_tests {
 
     #[test]
     fn jump() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let exit = function.new_block(0);
         function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
@@ -7941,7 +7940,7 @@ mod rpo_tests {
 
     #[test]
     fn diamond_iftrue() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let exit = function.new_block(0);
@@ -7956,7 +7955,7 @@ mod rpo_tests {
 
     #[test]
     fn diamond_iffalse() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let exit = function.new_block(0);
@@ -7971,7 +7970,7 @@ mod rpo_tests {
 
     #[test]
     fn a_loop() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         function.push_insn(entry, Insn::Jump(BranchEdge { target: entry, args: vec![] }));
         assert_eq!(function.rpo(), vec![entry]);
@@ -7994,7 +7993,7 @@ mod validation_tests {
 
     #[test]
     fn one_block_no_terminator() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         assert_matches_err(function.validate(), ValidationError::BlockHasNoTerminator(entry));
@@ -8002,7 +8001,7 @@ mod validation_tests {
 
     #[test]
     fn one_block_terminator_not_at_end() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         let insn_id = function.push_insn(entry, Insn::Return { val });
@@ -8012,7 +8011,7 @@ mod validation_tests {
 
     #[test]
     fn iftrue_mismatch_args() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
@@ -8022,7 +8021,7 @@ mod validation_tests {
 
     #[test]
     fn iffalse_mismatch_args() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
@@ -8032,7 +8031,7 @@ mod validation_tests {
 
     #[test]
     fn jump_mismatch_args() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
@@ -8042,7 +8041,7 @@ mod validation_tests {
 
     #[test]
     fn not_defined_within_bb() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         // Create an instruction without making it belong to anything.
         let dangling = function.new_insn(Insn::Const{val: Const::CBool(true)});
@@ -8052,7 +8051,7 @@ mod validation_tests {
 
     #[test]
     fn not_defined_within_bb_block_local() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         // Create an instruction without making it belong to anything.
         let dangling = function.new_insn(Insn::Const{val: Const::CBool(true)});
@@ -8062,7 +8061,7 @@ mod validation_tests {
 
     #[test]
     fn using_non_output_insn() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let const_ = function.push_insn(function.entry_block, Insn::Const{val: Const::CBool(true)});
         // Ret is a non-output instruction.
@@ -8073,7 +8072,7 @@ mod validation_tests {
 
     #[test]
     fn using_non_output_insn_block_local() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let const_ = function.push_insn(function.entry_block, Insn::Const{val: Const::CBool(true)});
         // Ret is a non-output instruction.
@@ -8085,7 +8084,7 @@ mod validation_tests {
     #[test]
     fn not_dominated_by_diamond() {
         // This tests that one branch is missing a definition which fails.
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let exit = function.new_block(0);
@@ -8104,7 +8103,7 @@ mod validation_tests {
     #[test]
     fn dominated_by_diamond() {
         // This tests that both branches with a definition succeeds.
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let exit = function.new_block(0);
@@ -8123,7 +8122,7 @@ mod validation_tests {
 
     #[test]
     fn instruction_appears_twice_in_same_block() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let block = function.new_block(0);
         function.push_insn(function.entry_block, Insn::Jump(BranchEdge { target: block, args: vec![] }));
         let val = function.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
@@ -8134,7 +8133,7 @@ mod validation_tests {
 
     #[test]
     fn instruction_appears_twice_with_different_ids() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let block = function.new_block(0);
         function.push_insn(function.entry_block, Insn::Jump(BranchEdge { target: block, args: vec![] }));
         let val0 = function.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
@@ -8146,7 +8145,7 @@ mod validation_tests {
 
     #[test]
     fn instruction_appears_twice_in_different_blocks() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let block = function.new_block(0);
         function.push_insn(function.entry_block, Insn::Jump(BranchEdge { target: block, args: vec![] }));
         let val = function.push_insn(block, Insn::Const { val: Const::Value(Qnil) });
@@ -8174,7 +8173,7 @@ mod infer_tests {
 
     #[test]
     fn test_const() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let val = function.push_insn(function.entry_block, Insn::Const { val: Const::Value(Qnil) });
         assert_bit_equal(function.infer_type(val), types::NilClass);
     }
@@ -8182,7 +8181,7 @@ mod infer_tests {
     #[test]
     fn test_nil() {
         crate::cruby::with_rubyvm(|| {
-            let mut function = Function::new(std::ptr::null());
+            let mut function = fake_function();
             let nil = function.push_insn(function.entry_block, Insn::Const { val: Const::Value(Qnil) });
             let val = function.push_insn(function.entry_block, Insn::Test { val: nil });
             function.infer_types();
@@ -8193,7 +8192,7 @@ mod infer_tests {
     #[test]
     fn test_false() {
         crate::cruby::with_rubyvm(|| {
-            let mut function = Function::new(std::ptr::null());
+            let mut function = fake_function();
             let false_ = function.push_insn(function.entry_block, Insn::Const { val: Const::Value(Qfalse) });
             let val = function.push_insn(function.entry_block, Insn::Test { val: false_ });
             function.infer_types();
@@ -8204,7 +8203,7 @@ mod infer_tests {
     #[test]
     fn test_truthy() {
         crate::cruby::with_rubyvm(|| {
-            let mut function = Function::new(std::ptr::null());
+            let mut function = fake_function();
             let true_ = function.push_insn(function.entry_block, Insn::Const { val: Const::Value(Qtrue) });
             let val = function.push_insn(function.entry_block, Insn::Test { val: true_ });
             function.infer_types();
@@ -8214,7 +8213,7 @@ mod infer_tests {
 
     #[test]
     fn newarray() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         // Fake FrameState index of 0usize
         let val = function.push_insn(function.entry_block, Insn::NewArray { elements: vec![], state: InsnId(0usize) });
         assert_bit_equal(function.infer_type(val), types::ArrayExact);
@@ -8222,7 +8221,7 @@ mod infer_tests {
 
     #[test]
     fn arraydup() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         // Fake FrameState index of 0usize
         let arr = function.push_insn(function.entry_block, Insn::NewArray { elements: vec![], state: InsnId(0usize) });
         let val = function.push_insn(function.entry_block, Insn::ArrayDup { val: arr, state: InsnId(0usize) });
@@ -8231,7 +8230,7 @@ mod infer_tests {
 
     #[test]
     fn diamond_iffalse_merge_fixnum() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let exit = function.new_block(0);
@@ -8250,7 +8249,7 @@ mod infer_tests {
 
     #[test]
     fn diamond_iffalse_merge_bool() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let entry = function.entry_block;
         let side = function.new_block(0);
         let exit = function.new_block(0);
@@ -8276,7 +8275,7 @@ mod graphviz_tests {
     #[track_caller]
     fn hir_string(method: &str) -> String {
         let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("self", method));
-        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
         let mut function = iseq_to_hir(iseq).unwrap();
         function.optimize();
         function.validate().unwrap();

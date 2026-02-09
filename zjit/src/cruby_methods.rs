@@ -319,7 +319,7 @@ fn inline_kernel_itself(_fun: &mut hir::Function, _block: hir::BlockId, recv: hi
 fn inline_kernel_block_given_p(fun: &mut hir::Function, block: hir::BlockId, _recv: hir::InsnId, args: &[hir::InsnId], _state: hir::InsnId) -> Option<hir::InsnId> {
     let &[] = args else { return None; };
 
-    let local_iseq = unsafe { rb_get_iseq_body_local_iseq(fun.iseq()) };
+    let local_iseq = unsafe { rb_get_iseq_body_local_iseq(fun.iseq().as_ptr()) };
     if unsafe { rb_get_iseq_body_type(local_iseq) } == ISEQ_TYPE_METHOD {
         let lep = fun.push_insn(block, hir::Insn::GetLEP);
         Some(fun.push_insn(block, hir::Insn::IsBlockGiven { lep }))

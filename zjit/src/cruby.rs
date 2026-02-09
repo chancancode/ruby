@@ -257,11 +257,64 @@ pub struct ID(pub ::std::os::raw::c_ulong);
 /// An unchecked raw pointer to an ISEQ (possibly null)
 pub type IseqPtr = *const rb_iseq_t;
 
+impl From<IseqPtr> for VALUE {
+    fn from(iseq: IseqPtr) -> Self {
+        VALUE(iseq as usize)
+    }
+}
+
 /// A checked ISEQ pointer, guaranteed to be a valid non-null iseq handle
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct Iseq(std::ptr::NonNull<rb_iseq_t>);
 
+pub type IseqParameters = rb_iseq_constant_body_rb_iseq_parameters;
+
+macro_rules! expect_iseq {
+    ($expr:expr) => { $crate::cruby::expect_iseq!($expr, "non-null ISEQ") };
+    ($expr:expr, $reason:expr) => {
+        $crate::cruby::VALUE::from($expr).as_iseq().expect($reason)
+    };
+}
+
+pub(crate) use expect_iseq;
+
 impl Iseq {
+    /// A private test-only sentinel value.
+    ///
+    /// Used by unit tests that needs to construct a dummy ISEQ pointer.
+    ///
+    /// When this was added, it's only used by unit tests constructing
+    /// `Function` to test the graph algorithms without the full RubyVM thus
+    /// without a proper way to construct a non-null `IseqPtr`.
+    ///
+    /// These tests are not interacting with the RubyVM so they don't actually
+    /// do anything meaningful with the ISEQ. The alternative would be would be
+    /// to have `Function` accept an `Option<Iseq>`, but this is contrary to
+    /// how we expect to use it in production and propagates a lot of `unwrap`s
+    /// to downstream consumers. Every time you see one of those you'd have to
+    /// know and remember why it can't actually happen in real code.
+    ///
+    /// Therefore this special sentinel value was added *in `cfg(test)` only*
+    /// as a compromise to carefully contain that testing quirk:
+    ///
+    /// SAFETY: This is a well-aligned, non-null pointer that doesn't point to
+    /// a real/valid ISEQ. Just having it is not dangerous, but *dereferencing*
+    /// it is UB. Fortunately, the only public way to dereference an `Iseq` is
+    /// through `as_ptr()`, so we can check and panic if someone tries.
+    #[cfg(test)]
+    const DANGLING: Self = Iseq(std::ptr::NonNull::dangling());
+
+    /// Construct a dangling `Iseq` for unit tests. It does not point to a real
+    /// ISEQ and will panic if `as_ptr()` is called on it.
+    ///
+    /// The intention is to not further propagate this pattern, so if you find
+    /// yourself needing to reach for this in new area of code, please consider
+    /// if there are better factoring available.
+    #[cfg(test)]
+    pub unsafe fn dangling() -> Self {
+        Self::DANGLING
+    }
+
     pub fn new(ptr: IseqPtr) -> Option<Self> {
         #[cfg(debug_assertions)]
         if !ptr.is_null() {
@@ -272,11 +325,70 @@ impl Iseq {
     }
 
     pub fn as_ptr(self) -> IseqPtr {
+        #[cfg(test)]
+        assert!(
+            self != Self::DANGLING,
+            "Attempted to dereference a dangling Iseq pointer (you may need `Iseq::undangle()`)",
+        );
+
         self.0.as_ptr() as *const _
     }
 
     pub fn as_nullable_ptr(iseq: Option<Iseq>) -> IseqPtr {
         iseq.map_or(std::ptr::null(), |iseq| iseq.as_ptr())
+    }
+
+    /// Get a description of the ISEQ's signature. Analogous to `ISEQ_BODY(iseq)->param` in C.
+    pub unsafe fn params<'a>(self) -> &'a IseqParameters {
+        use crate::cast::IntoUsize;
+        unsafe { &*((*self.as_ptr()).body.byte_add(ISEQ_BODY_OFFSET_PARAM.to_usize()) as *const IseqParameters) }
+    }
+
+    /// Convert a possibly dangling `Iseq` into `Option<Iseq>`.
+    ///
+    /// At first glance this may see seem strange. Since `Iseq` is non-null,
+    /// wouldn't the `Iseq -> Option<Iseq>` conversion be simply `Some(self)`?
+    ///
+    /// And you'd be right – in production code that's exactly what this does.
+    /// However, in unit tests, we have the possibility of our special dangling
+    /// pointer, which, if dereferenced, would panic.
+    ///
+    /// This allows you to safely convert the possibly-dangling pointer back
+    /// into an `Option<Iseq>`.
+    ///
+    /// Generally, if you just need to convert `Iseq -> Option<Iseq>`, you
+    /// should simply use `Some(iseq)` (or `iseq.into()`), and only reach for
+    /// this if that resulted in the panic message that brought you here.
+    pub fn undangle(self) -> Option<Self> {
+        #[cfg(test)]
+        if self == Self::DANGLING {
+            return None;
+        }
+
+        Some(self)
+    }
+}
+
+impl std::fmt::Display for Iseq {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        #[cfg(test)]
+        if *self == Self::DANGLING {
+            return write!(f, "<manual>");
+        }
+
+        write!(f, "{}", iseq_get_location(*self, 0))
+    }
+}
+
+impl From<Iseq> for VALUE {
+    fn from(iseq: Iseq) -> Self {
+        iseq.as_ptr().into()
+    }
+}
+
+impl From<Option<Iseq>> for VALUE {
+    fn from(iseq: Option<Iseq>) -> Self {
+        Iseq::as_nullable_ptr(iseq).into()
     }
 }
 
@@ -300,23 +412,23 @@ impl ShapeId {
 }
 
 // Given an ISEQ pointer, convert PC to insn_idx
-pub fn iseq_pc_to_insn_idx(iseq: IseqPtr, pc: *mut VALUE) -> Option<u16> {
-    let pc_zero = unsafe { rb_iseq_pc_at_idx(iseq, 0) };
+pub fn iseq_pc_to_insn_idx(iseq: Iseq, pc: *mut VALUE) -> Option<u16> {
+    let pc_zero = unsafe { rb_iseq_pc_at_idx(iseq.as_ptr(), 0) };
     unsafe { pc.offset_from(pc_zero) }.try_into().ok()
 }
 
 /// Given an ISEQ pointer and an instruction index, return an opcode.
-pub fn iseq_opcode_at_idx(iseq: IseqPtr, insn_idx: u32) -> u32 {
-    let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
-    unsafe { rb_iseq_opcode_at_pc(iseq, pc) as u32 }
+pub fn iseq_opcode_at_idx(iseq: Iseq, insn_idx: u32) -> u32 {
+    let pc = unsafe { rb_iseq_pc_at_idx(iseq.as_ptr(), insn_idx) };
+    unsafe { rb_iseq_opcode_at_pc(iseq.as_ptr(), pc) as u32 }
 }
 
 /// Return true if a given ISEQ is known to escape EP to the heap on entry.
 ///
 /// As of vm_push_frame(), EP is always equal to BP. However, after pushing
 /// a frame, some ISEQ setups call vm_bind_update_env(), which redirects EP.
-pub fn iseq_escapes_ep(iseq: IseqPtr) -> bool {
-    match unsafe { get_iseq_body_type(iseq) } {
+pub fn iseq_escapes_ep(iseq: Iseq) -> bool {
+    match unsafe { get_iseq_body_type(iseq.as_ptr()) } {
         // The EP of the <main> frame points to TOPLEVEL_BINDING
         ISEQ_TYPE_MAIN |
         // eval frames point to the EP of another frame or scope
@@ -336,13 +448,13 @@ pub fn iseq_rest_param_idx(params: &IseqParameters) -> Option<i32> {
 }
 
 /// Iterate over all existing ISEQs
-pub fn for_each_iseq<F: FnMut(IseqPtr)>(mut callback: F) {
+pub fn for_each_iseq<F: FnMut(Iseq)>(mut callback: F) {
     unsafe extern "C" fn callback_wrapper(iseq: IseqPtr, data: *mut c_void) {
         // SAFETY: points to the local below
-        let callback: &mut &mut dyn FnMut(IseqPtr) -> bool = unsafe { std::mem::transmute(&mut *data) };
-        callback(iseq);
+        let callback: &mut &mut dyn FnMut(Iseq) -> bool = unsafe { std::mem::transmute(&mut *data) };
+        callback(expect_iseq!(iseq, "for_each_iseq should yield non-null ISEQ"));
     }
-    let mut data: &mut dyn FnMut(IseqPtr) = &mut callback;
+    let mut data: &mut dyn FnMut(Iseq) = &mut callback;
     unsafe { rb_jit_for_each_iseq(Some(callback_wrapper), (&mut data) as *mut _ as *mut c_void) };
 }
 
@@ -653,11 +765,6 @@ impl VALUE {
         Iseq::new(self.as_ptr())
     }
 
-    /// Assert that `self` is a (possibly null) IseqPtr in debug builds
-    pub fn as_iseq_ptr(self) -> IseqPtr {
-        Iseq::as_nullable_ptr(self.as_iseq())
-    }
-
     pub fn cme_p(self) -> bool {
         if self == VALUE(0) { return false; }
         unsafe { rb_IMEMO_TYPE_P(self, imemo_ment) == 1 }
@@ -697,39 +804,6 @@ impl VALUE {
     }
 }
 
-pub type IseqParameters = rb_iseq_constant_body_rb_iseq_parameters;
-
-/// Extension trait to enable method calls on [`IseqPtr`]
-pub trait IseqAccess {
-    unsafe fn params<'a>(self) -> &'a IseqParameters;
-}
-
-impl IseqAccess for IseqPtr {
-    /// Get a description of the ISEQ's signature. Analogous to `ISEQ_BODY(iseq)->param` in C.
-    unsafe fn params<'a>(self) -> &'a IseqParameters {
-        use crate::cast::IntoUsize;
-        unsafe { &*((*self).body.byte_add(ISEQ_BODY_OFFSET_PARAM.to_usize()) as *const IseqParameters) }
-    }
-}
-
-impl From<IseqPtr> for VALUE {
-    /// For `.into()` convenience
-    fn from(iseq: IseqPtr) -> Self {
-        VALUE(iseq as usize)
-    }
-}
-
-impl IseqAccess for Iseq {
-    unsafe fn params<'a>(self) -> &'a IseqParameters {
-        unsafe { self.as_ptr().params() }
-    }
-}
-
-impl From<Iseq> for VALUE {
-    fn from(iseq: Iseq) -> Self {
-        VALUE(iseq.as_ptr() as usize)
-    }
-}
 
 impl From<*const rb_callable_method_entry_t> for VALUE {
     /// For `.into()` convenience
@@ -832,11 +906,8 @@ pub fn cstr_to_rust_string(c_char_ptr: *const c_char) -> Option<String> {
     }
 }
 
-pub fn iseq_name(iseq: IseqPtr) -> String {
-    if iseq.is_null() {
-        return "<NULL>".to_string();
-    }
-    let iseq_label = unsafe { rb_iseq_label(iseq) };
+pub fn iseq_name(iseq: Iseq) -> String {
+    let iseq_label = unsafe { rb_iseq_label(iseq.as_ptr()) };
     if iseq_label == Qnil {
         "None".to_string()
     } else {
@@ -847,9 +918,9 @@ pub fn iseq_name(iseq: IseqPtr) -> String {
 // Location is the file defining the method, colon, method name.
 // Filenames are sometimes internal strings supplied to eval,
 // so be careful with them.
-pub fn iseq_get_location(iseq: IseqPtr, pos: u32) -> String {
-    let iseq_path = unsafe { rb_iseq_path(iseq) };
-    let iseq_lineno = unsafe { rb_iseq_line_no(iseq, pos as usize) };
+pub fn iseq_get_location(iseq: Iseq, pos: u32) -> String {
+    let iseq_path = unsafe { rb_iseq_path(iseq.as_ptr()) };
+    let iseq_lineno = unsafe { rb_iseq_line_no(iseq.as_ptr(), pos as usize) };
 
     let mut s = iseq_name(iseq);
     s.push('@');
@@ -1210,20 +1281,20 @@ pub mod test_utils {
         ruby_str_to_rust_string(eval(&inspect))
     }
 
-    /// Get IseqPtr for a specified method
-    pub fn get_method_iseq(recv: &str, name: &str) -> *const rb_iseq_t {
+    /// Get Iseq for a specified method
+    pub fn get_method_iseq(recv: &str, name: &str) -> Iseq {
         get_proc_iseq(&format!("{}.method(:{})", recv, name))
     }
 
-    /// Get IseqPtr for a specified instance method
-    pub fn get_instance_method_iseq(recv: &str, name: &str) -> *const rb_iseq_t {
+    /// Get Iseq for a specified instance method
+    pub fn get_instance_method_iseq(recv: &str, name: &str) -> Iseq {
         get_proc_iseq(&format!("{}.instance_method(:{})", recv, name))
     }
 
-    /// Get IseqPtr for a specified Proc object
-    pub fn get_proc_iseq(obj: &str) -> *const rb_iseq_t {
+    /// Get Iseq for a specified Proc object
+    pub fn get_proc_iseq(obj: &str) -> Iseq {
         let wrapped_iseq = eval(&format!("RubyVM::InstructionSequence.of({obj})"));
-        unsafe { rb_iseqw_to_iseq(wrapped_iseq) }
+        expect_iseq!(unsafe { rb_iseqw_to_iseq(wrapped_iseq) })
     }
 
     /// Remove the minimum indent from every line, skipping the first and last lines if `trim_lines`.

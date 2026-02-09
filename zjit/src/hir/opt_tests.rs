@@ -14,7 +14,7 @@ mod hir_opt_tests {
     #[track_caller]
     fn hir_string_proc(proc: &str) -> String {
         let iseq = crate::cruby::with_rubyvm(|| get_proc_iseq(proc));
-        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
         let mut function = iseq_to_hir(iseq).unwrap();
         function.optimize();
         function.validate().unwrap();

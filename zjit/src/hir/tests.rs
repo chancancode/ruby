@@ -9,7 +9,7 @@ mod snapshot_tests {
     #[track_caller]
     fn hir_string(method: &str) -> String {
         let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("self", method));
-        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
         let function = iseq_to_hir(iseq).unwrap();
         format!("{}", FunctionPrinter::with_snapshot(&function))
     }
@@ -17,7 +17,7 @@ mod snapshot_tests {
     #[track_caller]
     fn optimized_hir_string(method: &str) -> String {
         let iseq = crate::cruby::with_rubyvm(|| get_proc_iseq(&format!("{}.method(:{})", "self", method)));
-        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
         let mut function = iseq_to_hir(iseq).unwrap();
         function.optimize();
         function.validate().unwrap();
@@ -165,15 +165,15 @@ pub mod hir_build_tests {
     use super::*;
     use insta::assert_snapshot;
 
-    fn iseq_contains_opcode(iseq: IseqPtr, expected_opcode: u32) -> bool {
-        let iseq_size = unsafe { get_iseq_encoded_size(iseq) };
+    fn iseq_contains_opcode(iseq: Iseq, expected_opcode: u32) -> bool {
+        let iseq_size = unsafe { get_iseq_encoded_size(iseq.as_ptr()) };
         let mut insn_idx = 0;
         while insn_idx < iseq_size {
             // Get the current pc and opcode
-            let pc = unsafe { rb_iseq_pc_at_idx(iseq, insn_idx) };
+            let pc = unsafe { rb_iseq_pc_at_idx(iseq.as_ptr(), insn_idx) };
 
             // try_into() call below is unfortunate. Maybe pick i32 instead of usize for opcodes.
-            let opcode: u32 = unsafe { rb_iseq_opcode_at_pc(iseq, pc) }
+            let opcode: u32 = unsafe { rb_iseq_opcode_at_pc(iseq.as_ptr(), pc) }
                 .try_into()
                 .unwrap();
             if opcode == expected_opcode {
@@ -187,14 +187,14 @@ pub mod hir_build_tests {
     #[track_caller]
     pub fn assert_contains_opcode(method: &str, opcode: u32) {
         let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("self", method));
-        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
         assert!(iseq_contains_opcode(iseq, opcode), "iseq {method} does not contain {}", insn_name(opcode as usize));
     }
 
     #[track_caller]
     fn assert_contains_opcodes(method: &str, opcodes: &[u32]) {
         let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("self", method));
-        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
         for &opcode in opcodes {
             assert!(iseq_contains_opcode(iseq, opcode), "iseq {method} does not contain {}", insn_name(opcode as usize));
         }
@@ -217,7 +217,7 @@ pub mod hir_build_tests {
     #[track_caller]
     fn hir_string_proc(proc: &str) -> String {
         let iseq = crate::cruby::with_rubyvm(|| get_proc_iseq(proc));
-        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
         let function = iseq_to_hir(iseq).unwrap();
         hir_string_function(&function)
     }
@@ -230,7 +230,7 @@ pub mod hir_build_tests {
     #[track_caller]
     fn assert_compile_fails(method: &str, reason: ParseError) {
         let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("self", method));
-        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
         let result = iseq_to_hir(iseq);
         assert!(result.is_err(), "Expected an error but successfully compiled to HIR: {}", FunctionPrinter::without_snapshot(&result.unwrap()));
         assert_eq!(result.unwrap_err(), reason);
@@ -3998,6 +3998,11 @@ pub mod hir_build_tests {
     }
  }
 
+ #[cfg(test)]
+ fn fake_function() -> Function {
+    Function::new(unsafe { Iseq::dangling() })
+ }
+
  /// Test successor and predecessor set computations.
  #[cfg(test)]
  mod control_flow_info_tests {
@@ -4009,7 +4014,7 @@ pub mod hir_build_tests {
 
      #[test]
      fn test_linked_list() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4032,7 +4037,7 @@ pub mod hir_build_tests {
 
      #[test]
      fn test_diamond() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4059,7 +4064,7 @@ pub mod hir_build_tests {
 
      #[test]
      fn test_cfi_deduplicated_successors_and_predecessors() {
-         let mut function = Function::new(std::ptr::null());
+         let mut function = fake_function();
 
          let bb0 = function.entry_block;
          let bb1 = function.new_block(0);
@@ -4098,7 +4103,7 @@ pub mod hir_build_tests {
 
      #[test]
      fn test_linked_list() {
-         let mut function = Function::new(std::ptr::null());
+         let mut function = fake_function();
 
          let bb0 = function.entry_block;
          let bb1 = function.new_block(0);
@@ -4135,7 +4140,7 @@ pub mod hir_build_tests {
 
      #[test]
      fn test_diamond() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4177,7 +4182,7 @@ pub mod hir_build_tests {
 
     #[test]
     fn test_complex_cfg() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4248,7 +4253,7 @@ pub mod hir_build_tests {
 
     #[test]
     fn test_back_edges() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4311,7 +4316,7 @@ pub mod hir_build_tests {
 
     #[test]
     fn test_multiple_entry_blocks() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4366,7 +4371,7 @@ mod loop_info_tests {
         // │ bb2 ◄──────┼ bb1 ◄─┐
         // └──┬──┘      └─────┘ │
         //    └─────────────────┘
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4424,7 +4429,7 @@ mod loop_info_tests {
         // ┌──▼──┐
         // │ bb4 │
         // └─────┘
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4504,7 +4509,7 @@ mod loop_info_tests {
         //        ┌──▼──┐
         //        │ bb6 │
         //        └─────┘
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4596,7 +4601,7 @@ mod loop_info_tests {
         // ┌──▼──┐
         // │ bb2 │
         // └─────┘
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4661,7 +4666,7 @@ mod loop_info_tests {
         // ┌──▼──┐  │
         // │ bb5 ┼──┘
         // └─────┘
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4738,7 +4743,7 @@ mod iongraph_tests {
 
     #[test]
     fn test_simple_function() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let bb0 = function.entry_block;
 
         let retval = function.push_insn(bb0, Insn::Const { val: Const::CBool(true) });
@@ -4750,7 +4755,7 @@ mod iongraph_tests {
 
     #[test]
     fn test_two_blocks() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
 
@@ -4765,7 +4770,7 @@ mod iongraph_tests {
 
     #[test]
     fn test_multiple_instructions() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let bb0 = function.entry_block;
 
         let val1 = function.push_insn(bb0, Insn::Const { val: Const::CBool(true) });
@@ -4777,7 +4782,7 @@ mod iongraph_tests {
 
     #[test]
     fn test_conditional_branch() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
 
@@ -4796,7 +4801,7 @@ mod iongraph_tests {
 
     #[test]
     fn test_loop_structure() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
 
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
@@ -4817,7 +4822,7 @@ mod iongraph_tests {
 
     #[test]
     fn test_multiple_successors() {
-        let mut function = Function::new(std::ptr::null());
+        let mut function = fake_function();
         let bb0 = function.entry_block;
         let bb1 = function.new_block(0);
         let bb2 = function.new_block(0);

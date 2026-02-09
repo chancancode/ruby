@@ -38,7 +38,7 @@ const PC_POISON: Option<*const VALUE> = if cfg!(feature = "runtime_checks") {
 /// Ephemeral code generation state
 struct JITState {
     /// Instruction sequence for the method being compiled
-    iseq: IseqPtr,
+    iseq: Iseq,
 
     /// ISEQ version that is being compiled, which will be used by PatchPoint
     version: IseqVersionRef,
@@ -58,7 +58,7 @@ struct JITState {
 
 impl JITState {
     /// Create a new JITState instance
-    fn new(iseq: IseqPtr, version: IseqVersionRef, num_insns: usize, num_blocks: usize) -> Self {
+    fn new(iseq: Iseq, version: IseqVersionRef, num_insns: usize, num_blocks: usize) -> Self {
         JITState {
             iseq,
             version,
@@ -97,6 +97,8 @@ impl JITState {
 /// See jit_compile_exception() for details.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, jit_exception: bool) -> *const u8 {
+    let iseq = expect_iseq!(iseq);
+
     // Take a lock to avoid writing to ISEQ in parallel with Ractors.
     // with_vm_lock() does nothing if the program doesn't use Ractors.
     with_vm_lock(src_loc!(), || {
@@ -126,7 +128,7 @@ pub extern "C" fn rb_zjit_iseq_gen_entry_point(iseq: IseqPtr, jit_exception: boo
 }
 
 /// Compile an entry point for a given ISEQ
-fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: IseqPtr, jit_exception: bool) -> Result<CodePtr, CompileError> {
+fn gen_iseq_entry_point(cb: &mut CodeBlock, iseq: Iseq, jit_exception: bool) -> Result<CodePtr, CompileError> {
     // We don't support exception handlers yet
     if jit_exception {
         return Err(CompileError::ExceptionHandler);
@@ -206,7 +208,7 @@ pub fn gen_entry_trampoline(cb: &mut CodeBlock) -> Result<CodePtr, CompileError>
 }
 
 /// Compile an ISEQ into machine code if not compiled yet
-fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> Result<IseqCodePtrs, CompileError> {
+fn gen_iseq(cb: &mut CodeBlock, iseq: Iseq, function: Option<&Function>) -> Result<IseqCodePtrs, CompileError> {
     // Return an existing pointer if it's already compiled
     let payload = get_or_create_iseq_payload(iseq);
     let last_status = payload.versions.last().map(|version| &unsafe { version.as_ref() }.status);
@@ -238,7 +240,7 @@ fn gen_iseq(cb: &mut CodeBlock, iseq: IseqPtr, function: Option<&Function>) -> R
 }
 
 /// Compile an ISEQ into machine code
-fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef, function: Option<&Function>) -> Result<IseqCodePtrs, CompileError> {
+fn gen_iseq_body(cb: &mut CodeBlock, iseq: Iseq, mut version: IseqVersionRef, function: Option<&Function>) -> Result<IseqCodePtrs, CompileError> {
     // If we ran out of code region, we shouldn't attempt to generate new code.
     if cb.has_dropped_bytes() {
         return Err(CompileError::OutOfMemory);
@@ -265,7 +267,7 @@ fn gen_iseq_body(cb: &mut CodeBlock, iseq: IseqPtr, mut version: IseqVersionRef,
 }
 
 /// Compile a function
-fn gen_function(cb: &mut CodeBlock, iseq: IseqPtr, version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
+fn gen_function(cb: &mut CodeBlock, iseq: Iseq, version: IseqVersionRef, function: &Function) -> Result<(IseqCodePtrs, Vec<CodePtr>, Vec<IseqCallRef>), CompileError> {
     let num_spilled_params = max_num_params(function).saturating_sub(ALLOC_REGS.len());
     let mut jit = JITState::new(iseq, version, function.num_insns(), function.num_blocks());
     let mut asm = Assembler::new_with_stack_slots(num_spilled_params);
@@ -625,7 +627,7 @@ fn gen_get_lep(jit: &JITState, asm: &mut Assembler) -> Opnd {
         level
     }
 
-    let level = get_lvar_level(jit.iseq);
+    let level = get_lvar_level(jit.iseq.as_ptr());
     gen_get_ep(asm, level)
 }
 
@@ -671,7 +673,7 @@ fn gen_defined(jit: &JITState, asm: &mut Assembler, op_type: usize, obj: VALUE, 
             // block handler. (e.g. `yield` in the top level script is a syntax error.)
             //
             // Similar to gen_is_block_given
-            let local_iseq = unsafe { rb_get_iseq_body_local_iseq(jit.iseq) };
+            let local_iseq = unsafe { rb_get_iseq_body_local_iseq(jit.iseq.as_ptr()) };
             if unsafe { rb_get_iseq_body_type(local_iseq) } == ISEQ_TYPE_METHOD {
                 let lep = gen_get_lep(jit, asm);
                 let block_handler = asm.load(Opnd::mem(64, lep, SIZEOF_VALUE_I32 * VM_ENV_DATA_INDEX_SPECVAL));
@@ -1501,7 +1503,7 @@ fn gen_send_iseq_direct(
     }
 
     // Make a method call. The target address will be rewritten once compiled.
-    let iseq_call = IseqCall::new(iseq.as_ptr(), num_optionals_passed);
+    let iseq_call = IseqCall::new(iseq, num_optionals_passed);
     let dummy_ptr = cb.get_write_ptr().raw_ptr(cb);
     jit.iseq_calls.push(iseq_call.clone());
     let ret = asm.ccall_with_iseq_call(dummy_ptr, c_args, &iseq_call);
@@ -2591,8 +2593,8 @@ fn gen_stack_overflow_check(jit: &mut JITState, asm: &mut Assembler, state: &Fra
 
 
 /// Inverse of ep_offset_to_local_idx(). See ep_offset_to_local_idx() for details.
-pub fn local_idx_to_ep_offset(iseq: IseqPtr, local_idx: usize) -> i32 {
-    let local_size = unsafe { get_iseq_body_local_table_size(iseq) };
+pub fn local_idx_to_ep_offset(iseq: Iseq, local_idx: usize) -> i32 {
+    let local_size = unsafe { get_iseq_body_local_table_size(iseq.as_ptr()) };
     local_size_and_idx_to_ep_offset(local_size.to_usize(), local_idx)
 }
 
@@ -2608,13 +2610,13 @@ pub fn local_size_and_idx_to_bp_offset(local_size: usize, local_idx: usize) -> i
 }
 
 /// Convert ISEQ into High-level IR
-fn compile_iseq(iseq: IseqPtr) -> Result<Function, CompileError> {
+fn compile_iseq(iseq: Iseq) -> Result<Function, CompileError> {
     // Convert ZJIT instructions back to bare instructions
-    unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+    unsafe { crate::cruby::rb_zjit_profile_disable(iseq.as_ptr()) };
 
     // Reject ISEQs with very large temp stacks.
     // We cannot encode too large offsets to access locals in arm64.
-    let stack_max = unsafe { rb_get_iseq_body_stack_max(iseq) };
+    let stack_max = unsafe { rb_get_iseq_body_stack_max(iseq.as_ptr()) };
     if stack_max >= i8::MAX as u32 {
         debug!("ISEQ stack too large: {stack_max}");
         return Err(CompileError::IseqStackTooLarge);
@@ -2699,18 +2701,18 @@ c_callable! {
             let iseq_call = unsafe { Rc::from_raw(iseq_call_ptr as *const IseqCall) };
             let iseq = iseq_call.iseq.get();
             let entry_insn_idxs = crate::hir::jit_entry_insns(iseq);
-            let pc = unsafe { rb_iseq_pc_at_idx(iseq, entry_insn_idxs[iseq_call.jit_entry_idx.to_usize()]) };
+            let pc = unsafe { rb_iseq_pc_at_idx(iseq.as_ptr(), entry_insn_idxs[iseq_call.jit_entry_idx.to_usize()]) };
             unsafe { rb_set_cfp_pc(cfp, pc) };
 
             // Successful JIT-to-JIT calls fill nils to non-parameter locals in generated code.
             // If we side-exit from function_stub_hit (before JIT code runs), we need to set them here.
-            fn prepare_for_exit(iseq: IseqPtr, cfp: CfpPtr, sp: *mut VALUE, compile_error: &CompileError) {
+            fn prepare_for_exit(iseq: Iseq, cfp: CfpPtr, sp: *mut VALUE, compile_error: &CompileError) {
                 unsafe {
                     // Set SP which gen_push_frame() doesn't set
                     rb_set_cfp_sp(cfp, sp);
 
                     // Fill nils to uninitialized (non-argument) locals
-                    let local_size = get_iseq_body_local_table_size(iseq).to_usize();
+                    let local_size = get_iseq_body_local_table_size(iseq.as_ptr()).to_usize();
                     let num_params = iseq.params().size.to_usize();
                     let base = sp.offset(-local_size_and_idx_to_bp_offset(local_size, num_params) as isize);
                     slice::from_raw_parts_mut(base, local_size - num_params).fill(Qnil);
@@ -3055,7 +3057,7 @@ impl JITEntry {
 #[derive(Debug)]
 pub struct IseqCall {
     /// Callee ISEQ that start_addr jumps to
-    pub iseq: Cell<IseqPtr>,
+    pub iseq: Cell<Iseq>,
 
     /// Index that corresponds to [crate::hir::jit_entry_insns]
     jit_entry_idx: u32,
@@ -3071,7 +3073,7 @@ pub type IseqCallRef = Rc<IseqCall>;
 
 impl IseqCall {
     /// Allocate a new IseqCall
-    fn new(iseq: IseqPtr, jit_entry_idx: u32) -> IseqCallRef {
+    fn new(iseq: Iseq, jit_entry_idx: u32) -> IseqCallRef {
         let iseq_call = IseqCall {
             iseq: Cell::new(iseq),
             start_addr: Cell::new(None),

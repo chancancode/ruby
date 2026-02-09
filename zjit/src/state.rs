@@ -247,7 +247,7 @@ impl ZJITState {
     }
 
     /// Check if we are allowed to compile a given ISEQ based on --zjit-allowed-iseqs
-    pub fn can_compile_iseq(iseq: cruby::IseqPtr) -> bool {
+    pub fn can_compile_iseq(iseq: cruby::Iseq) -> bool {
         if let Some(ref allowed_iseqs) = get_option!(allowed_iseqs) {
             let name = cruby::iseq_get_location(iseq, 0);
             allowed_iseqs.contains(&name)

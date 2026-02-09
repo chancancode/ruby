@@ -1,6 +1,5 @@
 //! This module is responsible for marking/moving objects on GC.
 
-use std::ptr::null;
 use std::{ffi::c_void, ops::Range};
 use crate::{cruby::*, state::ZJITState, stats::with_time_stat, virtualmem::CodePtr};
 use crate::payload::{IseqPayload, IseqVersionRef, get_or_create_iseq_payload};
@@ -53,13 +52,15 @@ pub extern "C" fn rb_zjit_iseq_free(iseq: IseqPtr) {
     }
 
     // TODO(Shopify/ruby#682): Free `IseqPayload`
-    let payload = get_or_create_iseq_payload(iseq);
-    for version in payload.versions.iter_mut() {
-        unsafe { version.as_mut() }.iseq = null();
-    }
+    if let Some(iseq) = Iseq::new(iseq) {
+        let payload = get_or_create_iseq_payload(iseq);
+        for version in payload.versions.iter_mut() {
+            unsafe { version.as_mut() }.iseq = None;
+        }
 
-    let invariants = ZJITState::get_invariants();
-    invariants.forget_iseq(iseq);
+        let invariants = ZJITState::get_invariants();
+        invariants.forget_iseq(iseq);
+    }
 }
 
 /// GC callback for finalizing a CME
@@ -131,12 +132,14 @@ fn iseq_update_references(payload: &mut IseqPayload) {
 
 fn iseq_version_update_references(mut version: IseqVersionRef) {
     // Move ISEQ in the payload
-    unsafe { version.as_mut() }.iseq = unsafe { rb_gc_location(version.as_ref().iseq.into()) }.as_iseq_ptr();
+    unsafe { version.as_mut() }.iseq = unsafe { version.as_ref() }.iseq.and_then(|iseq| {
+        unsafe { rb_gc_location(iseq.into()) }.as_iseq()
+    });
 
     // Move ISEQ references in incoming IseqCalls
     for iseq_call in unsafe { version.as_mut() }.incoming.iter_mut() {
         let old_iseq = iseq_call.iseq.get();
-        let new_iseq = unsafe { rb_gc_location(VALUE(old_iseq as usize)) }.0 as IseqPtr;
+        let new_iseq = expect_iseq!(unsafe { rb_gc_location(old_iseq.into()) });
         if old_iseq != new_iseq {
             iseq_call.iseq.set(new_iseq);
         }
@@ -145,7 +148,7 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
     // Move ISEQ references in outgoing IseqCalls
     for iseq_call in unsafe { version.as_mut() }.outgoing.iter_mut() {
         let old_iseq = iseq_call.iseq.get();
-        let new_iseq = unsafe { rb_gc_location(VALUE(old_iseq as usize)) }.0 as IseqPtr;
+        let new_iseq = expect_iseq!(unsafe { rb_gc_location(old_iseq.into()) });
         if old_iseq != new_iseq {
             iseq_call.iseq.set(new_iseq);
         }
@@ -173,7 +176,7 @@ fn iseq_version_update_references(mut version: IseqVersionRef) {
 }
 
 /// Append a set of gc_offsets to the iseq's payload
-pub fn append_gc_offsets(iseq: IseqPtr, mut version: IseqVersionRef, offsets: &Vec<CodePtr>) {
+pub fn append_gc_offsets(iseq: Iseq, mut version: IseqVersionRef, offsets: &Vec<CodePtr>) {
     unsafe { version.as_mut() }.gc_offsets.extend(offsets);
 
     // Call writebarrier on each newly added value

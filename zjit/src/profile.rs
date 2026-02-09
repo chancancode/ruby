@@ -4,7 +4,7 @@
 #![allow(non_upper_case_globals)]
 
 use std::collections::HashMap;
-use crate::{cruby::*, payload::get_or_create_iseq_payload, options::{get_option, NumProfiles}};
+use crate::{cruby::*, options::{NumProfiles, get_option}, payload::get_or_create_iseq_payload};
 use crate::distribution::{Distribution, DistributionSummary};
 use crate::stats::Counter::profile_time_ns;
 use crate::stats::with_time_stat;
@@ -12,18 +12,18 @@ use crate::stats::with_time_stat;
 /// Ephemeral state for profiling runtime information
 struct Profiler {
     cfp: CfpPtr,
-    iseq: IseqPtr,
+    iseq: Iseq,
     insn_idx: usize,
 }
 
 impl Profiler {
     fn new(ec: EcPtr) -> Self {
         let cfp = unsafe { get_ec_cfp(ec) };
-        let iseq = unsafe { get_cfp_iseq(cfp) };
+        let iseq = expect_iseq!(unsafe { get_cfp_iseq(cfp) });
         Profiler {
             cfp,
             iseq,
-            insn_idx: unsafe { get_cfp_pc(cfp).offset_from(get_iseq_body_iseq_encoded(iseq)) as usize },
+            insn_idx: unsafe { get_cfp_pc(cfp).offset_from(get_iseq_body_iseq_encoded(iseq.as_ptr())) as usize },
         }
     }
 
@@ -105,7 +105,7 @@ fn profile_insn(bare_opcode: ruby_vminsn_type, ec: EcPtr) {
     // Once we profile the instruction num_profiles times, we stop profiling it.
     profile.num_profiles[profiler.insn_idx] = profile.num_profiles[profiler.insn_idx].saturating_add(1);
     if profile.num_profiles[profiler.insn_idx] == get_option!(num_profiles) {
-        unsafe { rb_zjit_iseq_insn_set(profiler.iseq, profiler.insn_idx as u32, bare_opcode); }
+        unsafe { rb_zjit_iseq_insn_set(profiler.iseq.as_ptr(), profiler.insn_idx as u32, bare_opcode); }
     }
 }
 

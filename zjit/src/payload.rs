@@ -25,8 +25,10 @@ impl IseqPayload {
 /// JIT code version. When the same ISEQ is compiled with a different assumption, a new version is created.
 #[derive(Debug)]
 pub struct IseqVersion {
-    /// ISEQ pointer. Stored here to minimize the size of PatchPoint.
-    pub iseq: IseqPtr,
+    /// Back-pointer to the IseqPayload's ISEQ. Stored here to minimize the size of PatchPoint.
+    /// While the ISEQ is being freed this will be set to None.
+    // TODO(Shopify/ruby#682): Free `IseqPayload` – this can possibly be made non-nullable then?
+    pub iseq: Option<Iseq>,
 
     /// Compilation status of the ISEQ. It has the JIT code address of the first block if Compiled.
     pub status: IseqStatus,
@@ -46,9 +48,9 @@ pub type IseqVersionRef = NonNull<IseqVersion>;
 
 impl IseqVersion {
     /// Allocate a new IseqVersion to be compiled
-    pub fn new(iseq: IseqPtr) -> IseqVersionRef {
+    pub fn new(iseq: Iseq) -> IseqVersionRef {
         let version = Self {
-            iseq,
+            iseq: Some(iseq),
             status: IseqStatus::NotCompiled,
             gc_offsets: vec![],
             outgoing: vec![],
@@ -77,20 +79,20 @@ pub enum IseqStatus {
 }
 
 /// Get a pointer to the payload object associated with an ISEQ. Create one if none exists.
-pub fn get_or_create_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
+pub fn get_or_create_iseq_payload_ptr(iseq: Iseq) -> *mut IseqPayload {
     type VoidPtr = *mut c_void;
 
     unsafe {
-        let payload = rb_iseq_get_zjit_payload(iseq);
+        let payload = rb_iseq_get_zjit_payload(iseq.as_ptr());
         if payload.is_null() {
             // Allocate a new payload with Box and transfer ownership to the GC.
             // We drop the payload with Box::from_raw when the GC frees the ISEQ and calls us.
             // NOTE(alan): Sometimes we read from an ISEQ without ever writing to it.
             // We allocate in those cases anyways.
-            let iseq_size = get_iseq_encoded_size(iseq);
+            let iseq_size = get_iseq_encoded_size(iseq.as_ptr());
             let new_payload = IseqPayload::new(iseq_size);
             let new_payload = Box::into_raw(Box::new(new_payload));
-            rb_iseq_set_zjit_payload(iseq, new_payload as VoidPtr);
+            rb_iseq_set_zjit_payload(iseq.as_ptr(), new_payload as VoidPtr);
 
             new_payload
         } else {
@@ -100,7 +102,7 @@ pub fn get_or_create_iseq_payload_ptr(iseq: IseqPtr) -> *mut IseqPayload {
 }
 
 /// Get the payload object associated with an ISEQ. Create one if none exists.
-pub fn get_or_create_iseq_payload(iseq: IseqPtr) -> &'static mut IseqPayload {
+pub fn get_or_create_iseq_payload(iseq: Iseq) -> &'static mut IseqPayload {
     let payload_non_null = get_or_create_iseq_payload_ptr(iseq);
     payload_ptr_as_mut(payload_non_null)
 }
